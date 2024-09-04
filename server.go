@@ -4,8 +4,9 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log/slog"    // Mengimpor slog untuk logging
-	"net"         // Mengimpor paket net untuk menangani koneksi jaringan
+	"log/slog" // Mengimpor slog untuk logging
+	"net"      // Mengimpor paket net untuk menangani koneksi jaringan
+	"strings"
 	"sync"        // Mengimpor paket sync untuk concurrency (Mutex)
 	"sync/atomic" // Mengimpor paket atomic untuk operasi atomic
 )
@@ -20,6 +21,9 @@ type server struct {
 	lastClientId int64              // ID terakhir dari client yang terhubung
 	clientsLock  sync.Mutex         // Mutex untuk melindungi akses ke map clients
 	shuttingDown bool               // Flag untuk menunjukkan apakah server sedang dalam proses shutdown
+
+	dbLock   sync.RWMutex
+	database map[string]string
 }
 
 // Fungsi untuk membuat server baru dengan listener dan logger
@@ -32,6 +36,9 @@ func NewServer(listener net.Listener, logger *slog.Logger) *server {
 		lastClientId: 0,                             // Inisialisasi ID client terakhir sebagai 0
 		clientsLock:  sync.Mutex{},                  // Inisialisasi Mutex untuk sinkronisasi akses ke clients
 		shuttingDown: false,                         // Inisialisasi flag shuttingDown sebagai false
+
+		dbLock:   sync.RWMutex{},
+		database: make(map[string]string),
 	}
 }
 
@@ -116,9 +123,8 @@ func (s *server) handleConn(clientId int64, conn net.Conn) {
 	)
 
 	for {
-		buff := make([]byte, 4096) // Alokasikan buffer dengan ukuran 4096 byte
-		n, err := conn.Read(buff)  // Baca data dari client dan simpan di buffer
-		if err != nil {            // Jika terjadi error saat membaca data
+		request, err := readArray(conn, true)
+		if err != nil { // Jika terjadi error saat membaca data
 			if !errors.Is(err, io.EOF) {
 				s.logger.Error(
 					"error reading from client",
@@ -130,12 +136,36 @@ func (s *server) handleConn(clientId int64, conn net.Conn) {
 			break
 		}
 
-		if n == 0 { // Jika tidak ada data yang dibaca
-			break // Keluar dari loop
+		s.logger.Debug(
+			"request received",
+			slog.Any("request", request),
+			slog.Any("clientId", clientId),
+		)
+
+		if len(request) == 0 {
+			s.logger.Error("missing command in the request", slog.Int64("clientId", clientId))
+			break
 		}
 
-		if _, err := conn.Write(buff[:n]); err != nil { // Tulis kembali data ke client (echo)
+		commandName, ok := request[0].(string)
+		if !ok {
+			s.logger.Error("command is not a string", slog.Int64("clientId", clientId))
+			break
+		}
 
+		switch strings.ToUpper(commandName) {
+		case "GET":
+			err = s.handleGetCommand(clientId, conn, request)
+
+		case "SET":
+			err = s.handleSetCommand(clientId, conn, request)
+
+		default:
+			s.logger.Debug("unknown command", slog.String("command", commandName), slog.Int64("clientId", clientId))
+			break
+		}
+
+		if _, err := conn.Write([]byte("+OK\r\n")); err != nil { // Tulis kembali data ke client (echo)
 			s.logger.Error(
 				"error writing to client",
 				slog.Int64("clientId", clientId),
@@ -143,7 +173,6 @@ func (s *server) handleConn(clientId int64, conn net.Conn) {
 			)
 		}
 	}
-
 	// Lock untuk memastikan operasi aman terhadap akses bersamaan ke clients
 	s.clientsLock.Lock()
 	if _, ok := s.clients[clientId]; !ok { // Cek apakah client masih ada di map clients
@@ -162,4 +191,68 @@ func (s *server) handleConn(clientId int64, conn net.Conn) {
 			slog.String("err", err.Error()),
 		)
 	}
+}
+
+func (s *server) handleGetCommand(clientId int64, conn net.Conn, command []any) error {
+	if len(command) < 2 {
+		_, err := conn.Write([]byte("-ERR missing key\r\n"))
+		return err
+	}
+
+	key, ok := command[1].(string)
+	if !ok {
+		_, err := conn.Write([]byte("-ERR missing key\r\n"))
+		return err
+	}
+
+	s.logger.Debug("GET key", slog.String("key", key), slog.Int64("clientId", clientId))
+
+	// Get key here
+	s.dbLock.RLock()
+	value, ok := s.database[key]
+	s.dbLock.RUnlock()
+
+	var err error
+	if ok {
+		resp := fmt.Sprintf("$%d\r\n%s\r\n", len(value), value)
+		_, err = conn.Write([]byte(resp))
+	} else {
+		_, err = conn.Write([]byte("_\r\n"))
+	}
+
+	return err
+}
+
+func (s *server) handleSetCommand(clientId int64, conn net.Conn, command []any) error {
+	if len(command) < 3 {
+		_, err := conn.Write([]byte("-ERR missing ket and value\r\n"))
+		return err
+	}
+
+	key, ok := command[1].(string)
+	if !ok {
+		_, err := conn.Write([]byte("-ERR missing ket and value\r\n"))
+		return err
+	}
+
+	value, ok := command[2].(string)
+	if !ok {
+		_, err := conn.Write([]byte("-ERR missing ket and value\r\n"))
+		return err
+	}
+
+	s.logger.Debug(
+		"SET key int o value",
+		slog.String("key", key),
+		slog.String("value", value),
+		slog.Int64("clientId", clientId),
+	)
+
+	// Lock set here
+	s.dbLock.Lock()
+	s.database[key] = value
+	s.dbLock.Unlock()
+
+	_, err := conn.Write([]byte("+OK\r\n"))
+	return err
 }

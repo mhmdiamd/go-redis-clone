@@ -85,9 +85,9 @@ func readArray(r io.Reader, readFirstChar bool) ([]any, error) {
 
 func readOne(r io.Reader) (byte, error) {
 	buff := [1]byte{}
-	n, err := r.Read(buff[:1])
+	n, err := r.Read(buff[:])
 	if err != nil {
-		return 0, io.EOF
+		return 0, err
 	}
 
 	if n != 1 {
@@ -118,7 +118,7 @@ func readLength(r io.Reader) (int, error) {
 	}
 
 	if b != '\n' {
-		return 0, fmt.Errorf("expected newl;ine character for l;ength, but found %c", b)
+		return 0, fmt.Errorf("expected newline character for length, but found %c", b)
 	}
 
 	return result, nil
